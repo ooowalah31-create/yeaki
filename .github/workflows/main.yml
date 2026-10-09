@@ -10,13 +10,13 @@ on:
       install_extras:
         description: 'Install extra tools? (yes/no)'
         required: true
-        default: 'yes'
+        default: 'no'
         type: choice
         options:
           - 'yes'
           - 'no'
       enable_novnc:
-        description: 'Enable web-based VNC access? (yes/no)'
+        description: 'Enable VNC access? (yes/no)'
         required: true
         default: 'yes'
         type: choice
@@ -31,72 +31,80 @@ jobs:
 
     steps:
       # ═══════════════════════════════════════════
-      # STEP 1 — TAILSCALE SETUP
+      # STEP 1 — INSTALL TAILSCALE
       # ═══════════════════════════════════════════
-      - name: "[1/10] Install Tailscale"
+      - name: "[1/9] Install Tailscale"
         shell: pwsh
         run: |
-          Write-Host "⚡ Installing Tailscale..." -ForegroundColor Cyan
+          Write-Host "Installing Tailscale..." -ForegroundColor Cyan
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ts.exe"
           Start-Process -FilePath "$env:TEMP\ts.exe" -ArgumentList "/quiet" -Wait
           Start-Sleep -Seconds 12
-          Write-Host "✓ Tailscale installed" -ForegroundColor Green
+          Write-Host "Tailscale installed" -ForegroundColor Green
 
-      - name: "[2/10] Connect Tailscale"
+      # ═══════════════════════════════════════════
+      # STEP 2 — CONNECT TAILSCALE (TANPA --ssh)
+      # ═══════════════════════════════════════════
+      - name: "[2/9] Connect Tailscale"
         shell: pwsh
         run: |
-          Write-Host "⚡ Connecting to tailnet..." -ForegroundColor Cyan
+          Write-Host "Connecting to tailnet..." -ForegroundColor Cyan
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          
           & $ts up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} `
                   --hostname=cronus-rdp-${{ github.run_id }} `
                   --accept-routes `
-                  --accept-dns `
-                  --ssh
+                  --accept-dns
+          
           Start-Sleep -Seconds 25
-          $ip = (& $ts ip -4).Trim()
+          
+          $ip = (& $ts ip -4 2>$null)
+          if ($ip) { $ip = $ip.Trim() }
+          
+          if (-not $ip) {
+            Write-Host "GAGAL dapat IP Tailscale. Status:" -ForegroundColor Red
+            & $ts status
+            exit 1
+          }
+          
           $dns = (& $ts status --json | ConvertFrom-Json).Self.DNSName -replace '\.$',''
           echo "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
           echo "TS_DNS=$dns" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "✓ Connected. IP: $ip | DNS: $dns" -ForegroundColor Green
+          Write-Host "Connected. IP: $ip | DNS: $dns" -ForegroundColor Green
 
       # ═══════════════════════════════════════════
-      # STEP 3 — ENABLE RDP (MAXIMUM AGGRESSION)
+      # STEP 3 — ENABLE RDP + FIREWALL
       # ═══════════════════════════════════════════
-      - name: "[3/10] Enable RDP + Firewall"
+      - name: "[3/9] Enable RDP + Firewall"
         shell: pwsh
         run: |
-          Write-Host "⚡ Enabling RDP..." -ForegroundColor Cyan
+          Write-Host "Enabling RDP..." -ForegroundColor Cyan
           
-          # Registry tweaks
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 1
           
-          # Disable NLA via policy
           $path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           if (!(Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
           Set-ItemProperty -Path $path -Name "UserAuthentication" -Value 0
           
-          # Firewall
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           Remove-NetFirewallRule -Name "RDP-*" -ErrorAction SilentlyContinue
           New-NetFirewallRule -Name "RDP-TCP" -DisplayName "RDP TCP 3389" -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any -Direction Inbound
           New-NetFirewallRule -Name "RDP-UDP" -DisplayName "RDP UDP 3389" -Protocol UDP -LocalPort 3389 -Action Allow -Profile Any -Direction Inbound
           
-          # Restart
           Restart-Service TermService -Force
           Start-Sleep -Seconds 5
-          Write-Host "✓ RDP enabled" -ForegroundColor Green
+          Write-Host "RDP enabled" -ForegroundColor Green
 
       # ═══════════════════════════════════════════
       # STEP 4 — SET PASSWORD & USER
       # ═══════════════════════════════════════════
-      - name: "[4/10] Configure User & Password"
+      - name: "[4/9] Configure User & Password"
         shell: pwsh
         run: |
-          Write-Host "⚡ Setting up user..." -ForegroundColor Cyan
+          Write-Host "Setting up user..." -ForegroundColor Cyan
           $pass = ConvertTo-SecureString "${{ github.event.inputs.password }}" -AsPlainText -Force
           Set-LocalUser -Name "runneradmin" -Password $pass
           net user runneradmin /active:yes
@@ -105,21 +113,19 @@ jobs:
           net localgroup "Remote Desktop Users" runneradmin /add 2>$null
           wmic useraccount where "name='runneradmin'" set PasswordExpires=false
           
-          # Set timezone ke WIB
           tzutil /s "SE Asia Standard Time"
           
-          Write-Host "✓ User configured" -ForegroundColor Green
+          Write-Host "User configured" -ForegroundColor Green
 
       # ═══════════════════════════════════════════
-      # STEP 5 — INSTALL EXTRAS (OPTIONAL)
+      # STEP 5 — INSTALL EXTRAS (OPSIONAL)
       # ═══════════════════════════════════════════
-      - name: "[5/10] Install Extra Tools"
+      - name: "[5/9] Install Extra Tools"
         if: ${{ github.event.inputs.install_extras == 'yes' }}
         shell: pwsh
         run: |
-          Write-Host "⚡ Installing extras (this takes a while)..." -ForegroundColor Cyan
+          Write-Host "Installing extras (this takes 10+ min)..." -ForegroundColor Cyan
           
-          # Winget packages
           $packages = @(
             "Google.Chrome",
             "Microsoft.VisualStudioCode",
@@ -128,51 +134,46 @@ jobs:
             "Python.Python.3.12",
             "OpenJS.NodeJS.LTS",
             "Notepad++.Notepad++",
-            "Mozilla.Firefox",
-            "Discord.Discord",
-            "Valve.Steam"
+            "Mozilla.Firefox"
           )
           
           foreach ($pkg in $packages) {
-            Write-Host "  → Installing $pkg..." -ForegroundColor Yellow
+            Write-Host "  Installing $pkg..." -ForegroundColor Yellow
             winget install --id $pkg --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
           }
           
-          Write-Host "✓ Extras installed" -ForegroundColor Green
+          Write-Host "Extras installed" -ForegroundColor Green
 
       # ═══════════════════════════════════════════
-      # STEP 6 — ENABLE noVNC (WEB ACCESS)
+      # STEP 6 — SETUP VNC (OPSIONAL)
       # ═══════════════════════════════════════════
-      - name: "[6/10] Setup noVNC Web Access"
+      - name: "[6/9] Setup VNC"
         if: ${{ github.event.inputs.enable_novnc == 'yes' }}
         shell: pwsh
         run: |
-          Write-Host "⚡ Setting up noVNC..." -ForegroundColor Cyan
+          Write-Host "Setting up TightVNC..." -ForegroundColor Cyan
           
-          # Download TightVNC + noVNC
           $vncUrl = "https://www.tightvnc.com/download/2.8.84/tightvnc-2.8.84-gpl-setup-64bit.msi"
           Invoke-WebRequest -Uri $vncUrl -OutFile "$env:TEMP\vnc.msi"
-          Start-Process msiexec.exe -ArgumentList "/i $env:TEMP\vnc.msi /quiet /norestart ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=${{ github.event.inputs.password }} SET_VIEWONLYPASSWORD=0 VALUE_OF_VIEWONLYPASSWORD=0" -Wait
+          
+          $vncPass = "${{ github.event.inputs.password }}"
+          if ($vncPass.Length -gt 8) { $vncPass = $vncPass.Substring(0,8) }
+          
+          Start-Process msiexec.exe -ArgumentList "/i $env:TEMP\vnc.msi /quiet /norestart ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=$vncPass SET_VIEWONLYPASSWORD=0 VALUE_OF_VIEWONLYPASSWORD=0" -Wait
           
           Start-Sleep -Seconds 15
           
-          # Configure VNC port
-          $vncPath = "C:\Program Files\TightVNC"
-          & "$vncPath\tvnserver.exe" -controlservice -connect
-          Start-Sleep -Seconds 5
-          
-          # Firewall for VNC
           New-NetFirewallRule -Name "VNC-5900" -DisplayName "VNC 5900" -Protocol TCP -LocalPort 5900 -Action Allow -Profile Any -ErrorAction SilentlyContinue
           
-          Write-Host "✓ VNC enabled on port 5900" -ForegroundColor Green
+          Write-Host "VNC enabled on port 5900" -ForegroundColor Green
 
       # ═══════════════════════════════════════════
-      # STEP 7 — VERIFY EVERYTHING
+      # STEP 7 — HEALTH CHECK
       # ═══════════════════════════════════════════
-      - name: "[7/10] Health Check"
+      - name: "[7/9] Health Check"
         shell: pwsh
         run: |
-          Write-Host "`n═══════════ HEALTH CHECK ═══════════" -ForegroundColor Magenta
+          Write-Host "`n=== HEALTH CHECK ===" -ForegroundColor Magenta
           
           Write-Host "`n[+] RDP Port:" -ForegroundColor Cyan
           netstat -an | Select-String ":3389" | Select-Object -First 5
@@ -181,7 +182,7 @@ jobs:
           Get-Service TermService | Format-Table -AutoSize
           
           if ("${{ github.event.inputs.enable_novnc }}" -eq "yes") {
-            Write-Host "`n[+] VNC Port:" -ForegroundColor Cyan
+            Write-Host "`n[+] VNC Port 5900:" -ForegroundColor Cyan
             netstat -an | Select-String ":5900" | Select-Object -First 3
           }
           
@@ -189,112 +190,76 @@ jobs:
           & "C:\Program Files\Tailscale\tailscale.exe" status
           
           Write-Host "`n[+] System Info:" -ForegroundColor Cyan
-          Write-Host "  OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          Write-Host "  OS : $((Get-CimInstance Win32_OperatingSystem).Caption)"
           Write-Host "  RAM: $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,2)) GB"
           Write-Host "  CPU: $((Get-CimInstance Win32_Processor).Name)"
-          Write-Host "  CPU Cores: $((Get-CimInstance Win32_Processor).NumberOfCores)"
-          
-          Write-Host "`n════════════════════════════════════" -ForegroundColor Magenta
+          Write-Host "  Core: $((Get-CimInstance Win32_Processor).NumberOfCores)"
+          Write-Host ""
 
       # ═══════════════════════════════════════════
       # STEP 8 — SHOW CONNECTION INFO
       # ═══════════════════════════════════════════
-      - name: "[8/10] Connection Info"
+      - name: "[8/9] Connection Info"
         shell: pwsh
         run: |
           $ip = "${{ env.TS_IP }}"
           $dns = "${{ env.TS_DNS }}"
           $pass = "${{ github.event.inputs.password }}"
-          $novnc = "${{ github.event.inputs.enable_novnc }}"
+          $vnc = "${{ github.event.inputs.enable_novnc }}"
           
           Write-Host ""
-          Write-Host "╔══════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-          Write-Host "║         🏛️  CRONUS ULTIMATE RDP — READY  🏛️          ║" -ForegroundColor Cyan
-          Write-Host "╠══════════════════════════════════════════════════════╣" -ForegroundColor Cyan
-          Write-Host "║                                                      ║" -ForegroundColor Cyan
-          Write-Host "║  📡 RDP ACCESS                                       ║" -ForegroundColor Yellow
-          Write-Host "║  ────────────────────────────────────                ║" -ForegroundColor Yellow
-          Write-Host "║  Host     : $ip                          ║" -ForegroundColor White
-          Write-Host "║  DNS      : $dns" -ForegroundColor White
-          Write-Host "║  Port     : 3389                                     ║" -ForegroundColor White
-          Write-Host "║  User     : runneradmin                              ║" -ForegroundColor White
-          Write-Host "║  Password : $pass" -ForegroundColor White
-          Write-Host "║                                                      ║" -ForegroundColor Cyan
+          Write-Host "======================================================" -ForegroundColor Cyan
+          Write-Host "         CRONUS ULTIMATE RDP -- READY                " -ForegroundColor Cyan
+          Write-Host "======================================================" -ForegroundColor Cyan
+          Write-Host ""
+          Write-Host "  [RDP ACCESS]" -ForegroundColor Yellow
+          Write-Host "  --------------------------------" -ForegroundColor Yellow
+          Write-Host "  Host     : $ip" -ForegroundColor White
+          Write-Host "  DNS      : $dns" -ForegroundColor White
+          Write-Host "  Port     : 3389" -ForegroundColor White
+          Write-Host "  User     : runneradmin" -ForegroundColor White
+          Write-Host "  Password : $pass" -ForegroundColor White
+          Write-Host ""
           
-          if ($novnc -eq "yes") {
-            Write-Host "║  🌐 VNC ACCESS (via browser/Tailscale)              ║" -ForegroundColor Yellow
-            Write-Host "║  ────────────────────────────────────                ║" -ForegroundColor Yellow
-            Write-Host "║  Host     : $ip:5900                     ║" -ForegroundColor White
-            Write-Host "║  Password : $pass" -ForegroundColor White
-            Write-Host "║                                                      ║" -ForegroundColor Cyan
+          if ($vnc -eq "yes") {
+            Write-Host "  [VNC ACCESS]" -ForegroundColor Yellow
+            Write-Host "  --------------------------------" -ForegroundColor Yellow
+            Write-Host "  Host     : $ip:5900" -ForegroundColor White
+            Write-Host "  Password : (8 char pertama dari password RDP)" -ForegroundColor White
+            Write-Host ""
           }
           
-          Write-Host "║  🔐 SSH (via Tailscale SSH)                          ║" -ForegroundColor Yellow
-          Write-Host "║  ────────────────────────────────────                ║" -ForegroundColor Yellow
-          Write-Host "║  ssh runneradmin@$ip" -ForegroundColor White
-          Write-Host "║                                                      ║" -ForegroundColor Cyan
-          Write-Host "║  ⏱️  Uptime: 6 jam                                   ║" -ForegroundColor Green
-          Write-Host "║  📅 Timezone: WIB (Asia/Jakarta)                     ║" -ForegroundColor Green
-          Write-Host "║                                                      ║" -ForegroundColor Cyan
-          Write-Host "╚══════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host "  [INFO]" -ForegroundColor Yellow
+          Write-Host "  --------------------------------" -ForegroundColor Yellow
+          Write-Host "  Uptime   : 6 jam" -ForegroundColor Green
+          Write-Host "  Timezone : WIB (Asia/Jakarta)" -ForegroundColor Green
+          Write-Host ""
+          Write-Host "======================================================" -ForegroundColor Cyan
           Write-Host ""
 
       # ═══════════════════════════════════════════
-      # STEP 9 — WATCHDOG (AUTO-RECONNECT)
+      # STEP 9 — KEEP ALIVE
       # ═══════════════════════════════════════════
-      - name: "[9/10] Start Watchdog"
+      - name: "[9/9] Keep Alive — 6 Hours"
         shell: pwsh
         run: |
-          # Background job: cek Tailscale + RDP tiap 5 menit
-          $job = Start-Job -ScriptBlock {
-            $ts = "C:\Program Files\Tailscale\tailscale.exe"
-            while ($true) {
-              Start-Sleep -Seconds 300
-              
-              # Cek Tailscale
-              $status = & $ts status 2>&1
-              if ($status -match "offline|stopped|Logged out") {
-                Write-Host "[$(Get-Date)] Tailscale down, reconnecting..."
-                & $ts up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --accept-routes --ssh
-              }
-              
-              # Cek RDP service
-              $svc = Get-Service TermService
-              if ($svc.Status -ne "Running") {
-                Write-Host "[$(Get-Date)] RDP down, restarting..."
-                Restart-Service TermService -Force
-              }
-            }
-          }
-          Write-Host "✓ Watchdog started (Job ID: $($job.Id))" -ForegroundColor Green
-
-      # ═══════════════════════════════════════════
-      # STEP 10 — KEEP ALIVE
-      # ═══════════════════════════════════════════
-      - name: "[10/10] Keep Alive — 6 Hours"
-        shell: pwsh
-        run: |
-          Write-Host "🕐 RDP aktif selama 6 jam." -ForegroundColor Green
-          Write-Host "🕐 Akan auto-terminate setelah 360 menit." -ForegroundColor Green
-          Write-Host ""
+          Write-Host "RDP aktif 6 jam. Auto-terminate setelah 360 menit." -ForegroundColor Green
           
-          # Heartbeat tiap 30 menit
           for ($i = 1; $i -le 12; $i++) {
             Start-Sleep -Seconds 1800
-            Write-Host "[$i/12] Heartbeat — $(Get-Date -Format 'HH:mm:ss') WIB" -ForegroundColor Cyan
+            Write-Host "[$i/12] Heartbeat - $(Get-Date -Format 'HH:mm:ss') WIB" -ForegroundColor Cyan
             
-            # Re-verify RDP port
             $rdp = netstat -an | Select-String ":3389.*LISTENING"
             if (-not $rdp) {
-              Write-Host "⚠️ RDP port mati! Restart..." -ForegroundColor Red
+              Write-Host "RDP port mati! Restart..." -ForegroundColor Red
               Restart-Service TermService -Force
             }
             
-            # Tailscale ping
             $tsIP = "${{ env.TS_IP }}"
-            $ping = Test-Connection -ComputerName $tsIP -Count 1 -Quiet -ErrorAction SilentlyContinue
-            if (-not $ping) {
-              Write-Host "⚠️ Tailscale down! Reconnect..." -ForegroundColor Red
-              & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --accept-routes --ssh
+            $ts = "C:\Program Files\Tailscale\tailscale.exe"
+            $status = & $ts status 2>&1
+            if ($status -match "offline|Logged out|NeedsLogin") {
+              Write-Host "Tailscale down! Reconnect..." -ForegroundColor Red
+              & $ts up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --accept-routes --accept-dns
             }
           }
