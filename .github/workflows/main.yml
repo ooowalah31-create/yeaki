@@ -3,6 +3,10 @@ name: Cronus Ultimate RDP
 on:
   workflow_dispatch:
     inputs:
+      rdp_user:
+        description: 'Username untuk RDP (default: cronus)'
+        required: true
+        default: 'cronus'
       password:
         description: 'RDP Password (min 8 chars)'
         required: true
@@ -99,52 +103,86 @@ jobs:
           Write-Host "RDP enabled" -ForegroundColor Green
 
       # ═══════════════════════════════════════════
-      # STEP 4 — CONFIGURE USER & PASSWORD (FIXED)
+      # STEP 4 — CONFIGURE CUSTOM USER & PASSWORD (FULL FIX)
       # ═══════════════════════════════════════════
-      - name: "[4/9] Configure User & Password"
+      - name: "[4/9] Configure Custom User & Password"
         shell: pwsh
         run: |
-          Write-Host "Setting up user..." -ForegroundColor Cyan
+          Write-Host "Setting up custom user..." -ForegroundColor Cyan
           
-          # Set password
-          $pass = ConvertTo-SecureString "${{ github.event.inputs.password }}" -AsPlainText -Force
-          Set-LocalUser -Name "runneradmin" -Password $pass
+          $username = "${{ github.event.inputs.rdp_user }}"
+          $rawpass  = "${{ github.event.inputs.password }}"
           
-          # Aktifkan akun & password tidak expire (pakai Set-LocalUser, bukan wmic)
-          Set-LocalUser -Name "runneradmin" -PasswordNeverExpires $true
-          Set-LocalUser -Name "runneradmin" -AccountNeverExpires $true
-          
-          # Pastikan user enabled
-          Enable-LocalUser -Name "runneradmin"
-          
-          # Tambah ke group pakai PowerShell (bukan net localgroup)
-          try {
-            Add-LocalGroupMember -Group "Administrators" -Member "runneradmin" -ErrorAction Stop
-            Write-Host "  Added to Administrators" -ForegroundColor Green
-          } catch {
-            Write-Host "  Already in Administrators (skip)" -ForegroundColor Yellow
+          # Validasi
+          if ($username.Length -lt 3) {
+            Write-Host "Username minimal 3 karakter!" -ForegroundColor Red
+            exit 1
+          }
+          if ($rawpass.Length -lt 8) {
+            Write-Host "Password minimal 8 karakter!" -ForegroundColor Red
+            exit 1
           }
           
-          try {
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction Stop
-            Write-Host "  Added to Remote Desktop Users" -ForegroundColor Green
-          } catch {
-            Write-Host "  Already in Remote Desktop Users (skip)" -ForegroundColor Yellow
+          $securePass = ConvertTo-SecureString $rawpass -AsPlainText -Force
+          
+          # ─── Buat user baru (atau update kalau sudah ada) ───
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          
+          if ($existing) {
+            Write-Host "  User '$username' sudah ada. Update password..." -ForegroundColor Yellow
+            Set-LocalUser -Name $username -Password $securePass
+            Set-LocalUser -Name $username -PasswordNeverExpires $true
+            Enable-LocalUser -Name $username
+          } else {
+            Write-Host "  Membuat user baru: $username" -ForegroundColor Yellow
+            New-LocalUser `
+              -Name $username `
+              -Password $securePass `
+              -PasswordNeverExpires `
+              -AccountNeverExpires `
+              -Description "Cronus RDP User" `
+              -ErrorAction Stop
+            Write-Host "  User dibuat." -ForegroundColor Green
           }
           
-          # Set timezone WIB
+          # ─── Tambah ke group ───
+          $groups = @("Administrators", "Remote Desktop Users")
+          foreach ($grp in $groups) {
+            try {
+              $members = Get-LocalGroupMember -Group $grp -ErrorAction Stop | Select-Object -ExpandProperty Name
+              $found = $members | Where-Object { $_ -match "\\$username$" -or $_ -eq $username }
+              if ($found) {
+                Write-Host "  '$username' sudah ada di '$grp' (skip)" -ForegroundColor DarkGray
+              } else {
+                Add-LocalGroupMember -Group $grp -Member $username -ErrorAction Stop
+                Write-Host "  '$username' ditambahkan ke '$grp'" -ForegroundColor Green
+              }
+            } catch {
+              Write-Host "  Gagal tambah ke '$grp': $($_.Exception.Message)" -ForegroundColor Red
+            }
+          }
+          
+          # ─── Aktifkan akun bawaan 'runneradmin' juga (backup) ───
+          try {
+            Set-LocalUser -Name "runneradmin" -Password $securePass -ErrorAction Stop
+            Write-Host "  'runneradmin' password juga di-set (backup)" -ForegroundColor DarkGray
+          } catch {
+            Write-Host "  'runneradmin' skip: $($_.Exception.Message)" -ForegroundColor DarkGray
+          }
+          
+          # ─── Timezone WIB ───
           tzutil /s "SE Asia Standard Time"
           
-          # Verifikasi
+          # ─── Verifikasi ───
           Write-Host ""
-          Write-Host "=== User Verification ===" -ForegroundColor Cyan
-          $user = Get-LocalUser -Name "runneradmin"
-          Write-Host "  Name           : $($user.Name)"
-          Write-Host "  Enabled        : $($user.Enabled)"
-          Write-Host "  PasswordExpires: $($user.PasswordExpires)"
-          Write-Host "  LastSet        : $($user.PasswordLastSet)"
+          Write-Host "=== Verifikasi User ===" -ForegroundColor Cyan
+          $u = Get-LocalUser -Name $username
+          Write-Host "  Name           : $($u.Name)"
+          Write-Host "  Enabled        : $($u.Enabled)"
+          Write-Host "  PasswordExpires: $($u.PasswordExpires)"
+          Write-Host "  PasswordSet    : $($u.PasswordLastSet)"
           Write-Host ""
-          Write-Host "User configured" -ForegroundColor Green
+          Write-Host "User '$username' siap dipakai untuk RDP." -ForegroundColor Green
 
       # ═══════════════════════════════════════════
       # STEP 5 — INSTALL EXTRAS (OPSIONAL)
@@ -231,10 +269,11 @@ jobs:
       - name: "[8/9] Connection Info"
         shell: pwsh
         run: |
-          $ip = "${{ env.TS_IP }}"
-          $dns = "${{ env.TS_DNS }}"
-          $pass = "${{ github.event.inputs.password }}"
-          $vnc = "${{ github.event.inputs.enable_novnc }}"
+          $ip    = "${{ env.TS_IP }}"
+          $dns   = "${{ env.TS_DNS }}"
+          $user  = "${{ github.event.inputs.rdp_user }}"
+          $pass  = "${{ github.event.inputs.password }}"
+          $vnc   = "${{ github.event.inputs.enable_novnc }}"
           
           Write-Host ""
           Write-Host "======================================================" -ForegroundColor Cyan
@@ -246,7 +285,7 @@ jobs:
           Write-Host "  Host     : $ip" -ForegroundColor White
           Write-Host "  DNS      : $dns" -ForegroundColor White
           Write-Host "  Port     : 3389" -ForegroundColor White
-          Write-Host "  User     : runneradmin" -ForegroundColor White
+          Write-Host "  User     : $user" -ForegroundColor White
           Write-Host "  Password : $pass" -ForegroundColor White
           Write-Host ""
           
